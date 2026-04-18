@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 from dataset.fixmatch_dataset import build_fixmatch_datasets
 from models.losses.fixmatch_loss import fixmatch_loss
 from models.fixmatch import FixMatchModel
+import math
+from utils.ema import ModelEMA
 
 def evaluate(model, loader, device):
     model.eval()
@@ -59,7 +61,13 @@ def evaluate_per_class(model, loader, device):
     return per_class
 
 def train_fixmatch(cfg):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
 
     # make train data sets(labled and unlabeled), val data sets and test_datasets
     train_labeled_dataset, train_unlabeled_dataset, val_dataset, test_dataset = build_fixmatch_datasets(
@@ -100,6 +108,7 @@ def train_fixmatch(cfg):
     )
 
     model = FixMatchModel(cfg).to(device)
+    ema_model = ModelEMA(model, decay=0.999)
 
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -109,9 +118,12 @@ def train_fixmatch(cfg):
         nesterov=True,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.train.epochs
-    )
+    total_steps = cfg.train.epochs * 1000
+
+    def get_cosine_lr(step):
+        """FixMatch 논문 방식 cosine decay"""
+        progress = min(step / total_steps, 1.0)
+        return cfg.train.lr * math.cos(7.0 * math.pi * progress / 16.0)
 
     best_val_acc = 0.0
     history = []
@@ -164,19 +176,26 @@ def train_fixmatch(cfg):
             loss.backward()
             optimizer.step()
 
+            global_step = epoch * steps_per_epoch + step
+            current_lr = get_cosine_lr(global_step)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+
+            ema_model.update(model)
+
             epoch_loss += out["loss"].item()
             epoch_loss_x += out["loss_x"].item()
             epoch_loss_u += out["loss_u"].item()
             epoch_mask += out["mask"].item()
 
-        scheduler.step()
+        #scheduler.step()
 
         epoch_loss /= steps_per_epoch
         epoch_loss_x /= steps_per_epoch
         epoch_loss_u /= steps_per_epoch
         epoch_mask /= steps_per_epoch
 
-        val_acc = evaluate(model, val_loader, device)
+        val_acc = evaluate(ema_model.ema, val_loader, device)
         history.append(val_acc)
 
         print(
@@ -188,16 +207,15 @@ def train_fixmatch(cfg):
             f"val_acc={val_acc:.4f}"
         )
 
-
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), best_model_path)
+            torch.save(ema_model.ema.state_dict(), best_model_path)
 
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-    model.to(device)
+    ema_model.ema.load_state_dict(torch.load(best_model_path, map_location=device))
+    ema_model.ema.to(device)
 
-    test_acc = evaluate(model, test_loader, device)
-    per_class = evaluate_per_class(model, test_loader, device)
+    test_acc = evaluate(ema_model.ema, test_loader, device)
+    per_class = evaluate_per_class(ema_model.ema, test_loader, device)
 
     print(f"Best val acc: {best_val_acc:.4f}")
     print(f"Test acc: {test_acc:.4f}")
